@@ -22,8 +22,8 @@ from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 import torch.distributed as dist
-# import models
 import quant_vision_transformer
+
 import utils
 import wandb
 import socket
@@ -48,6 +48,7 @@ def get_args_parser():
     parser.add_argument('--wbits', default=4, type=int)
     parser.add_argument('--gbits', default=None, type=int)
     parser.add_argument('--qdtype', default='int8')
+    parser.add_argument('--bce-loss', action='store_true')
 
     parser.add_argument('--batch-size', default=64, type=int)
     parser.add_argument('--epochs', default=90, type=int)
@@ -120,7 +121,11 @@ def get_args_parser():
 
     parser.add_argument('--repeated-aug', action='store_true')
     parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
-    parser.set_defaults(repeated_aug=False)
+    parser.set_defaults(repeated_aug=True)
+
+    parser.add_argument('--train-mode', action='store_true')
+    parser.add_argument('--no-train-mode', action='store_false', dest='train_mode')
+    parser.set_defaults(train_mode=True)
 
     # * Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
@@ -175,6 +180,7 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
+    parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
     parser.add_argument('--dist-eval', action='store_true', default=True, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin-mem', action='store_true',
@@ -193,18 +199,6 @@ def get_args_parser():
 
 
 def main(args):
-    if args.qdtype == 'int8':
-        args.qdtype = torch.int8
-    elif args.qdtype == 'int32':
-        args.qdtype = torch.int32
-    elif args.qdtype == 'int64':
-        args.qdtype = torch.int64
-    elif args.qdtype == 'float32':
-        args.qdtype = torch.float32
-    else:
-        raise ValueError("지원되지 않는 자료형입니다.")
-
-
     node_rank = getattr(args, "ddp_rank", 0)
     if node_rank==0:
         print(args)
@@ -350,13 +344,13 @@ def main(args):
     model.to(device)
 
     model_ema = None
-    '''if args.model_ema:
+    if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEma(
             model,
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
-            resume='')'''
+            resume='')
 
     model_without_ddp = model
     if args.distributed:
@@ -396,16 +390,18 @@ def main(args):
 
     criterion = LabelSmoothingCrossEntropy()
 
-    if mixup_active:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+    # if mixup_active:
+    #     # smoothing is handled with mixup label transform
+    #     criterion = SoftTargetCrossEntropy()
+    # elif args.smoothing:
+    #     criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    # else:
+    #     criterion = torch.nn.CrossEntropyLoss()
+    # if args.bce_loss:
+    #     criterion = torch.nn.BCEWithLogitsLoss()
 
-    # criterion_dmd = torch.nn.MSELoss()
     criterion = torch.nn.CrossEntropyLoss()
+
 
     teacher_model = None
     if args.distillation_type != 'none':
@@ -416,12 +412,12 @@ def main(args):
             pretrained=True,
             num_classes=args.nb_classes,
         )
-        '''if args.teacher_path.startswith('https'):
+        if args.teacher_path.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.teacher_path, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.teacher_path, map_location='cpu')'''
-        '''teacher_model.load_state_dict(checkpoint['model'])'''
+            checkpoint = torch.load(args.teacher_path, map_location='cpu')
+        teacher_model.load_state_dict(checkpoint['model'])
         teacher_model.to(device)
         teacher_model.eval()
     # print(teacher_model)
@@ -444,7 +440,7 @@ def main(args):
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
-            if False: # args.model_ema:
+            if args.model_ema:
                 utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
@@ -467,10 +463,11 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             wandb_log,
-            model, teacher_model, criterion, data_loader_train,
+            model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
+            set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
+            args = args,
         )
 
         torch.cuda.empty_cache()

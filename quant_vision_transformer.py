@@ -629,23 +629,26 @@ class lowbit_VisionTransformer(nn.Module):
         x = self.pos_drop(x + self.pos_embed)
         x = self.blocks(x, iteration)
         x = self.norm(x)
-        if self.dist_token is None:
-            return self.pre_logits(x[:, 0])
-        else:
-            return x[:, 0], x[:, 1]
+        # if self.dist_token is None:
+        #     return self.pre_logits(x[:, 0])
+        # else:
+        return x[:, 0]
 
     def forward(self, x, iteration):
         x = self.forward_features(x, iteration)
-        if self.head_dist is not None:
-            x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
-            if self.training and not torch.jit.is_scripting():
-                # during inference, return the average of both classifier predictions
-                return x, x_dist
-            else:
-                return (x + x_dist) / 2
-        #Non-distillation
-        else: 
-            x = self.head(x)
+        x = self.head(x)
+
+
+        # if self.head_dist is not None:
+        #     x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
+        #     if self.training and not torch.jit.is_scripting():
+        #         # during inference, return the average of both classifier predictions
+        #         return x, x_dist
+        #     else:
+        #         return (x + x_dist) / 2
+        # #Non-distillation
+        # else: 
+        #     x = self.head(x)
         return x
 
 def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):

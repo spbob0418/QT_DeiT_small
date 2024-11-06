@@ -13,16 +13,16 @@ from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
 import torch.distributed as dist
 from losses import DistillationLoss
+import torch.nn.functional as F
 import utils
 import wandb
 
-
-
-def train_one_epoch(wandb_log, model: torch.nn.Module, teacher_model: torch.nn.Module, criterion: DistillationLoss,
+def train_one_epoch(wandb_log, model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True):
+                    set_training_mode=True, args = None):
+
     model.train(set_training_mode)
     # teacher_model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -34,6 +34,7 @@ def train_one_epoch(wandb_log, model: torch.nn.Module, teacher_model: torch.nn.M
     for iteration, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+
 
         # return_probe_tensor = (iteration % 10 == 0)
     
