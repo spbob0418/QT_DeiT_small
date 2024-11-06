@@ -31,7 +31,7 @@ import os
 # os.environ['SLURM_PROCID']
 
 DIST_PORT=6006
-WANDB_LOG = True
+WANDB_LOG = False
 WANDB_PROJ_NAME = 'DeiT_full precision'
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,6,7'

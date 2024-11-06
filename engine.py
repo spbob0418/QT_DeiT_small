@@ -37,7 +37,7 @@ def train_one_epoch(wandb_log, model: torch.nn.Module, teacher_model: torch.nn.M
 
         # return_probe_tensor = (iteration % 10 == 0)
     
-        outputs = model(samples)
+        outputs = model(samples,iteration)
         dist.barrier()
         loss = criterion(samples, outputs, targets)
         dist.barrier()

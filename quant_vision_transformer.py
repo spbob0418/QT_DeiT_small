@@ -17,6 +17,7 @@ from timm.models.resnet import resnet26d, resnet50d
 from timm.models.registry import register_model
 
 import numpy as np
+from probe import process_tensor
 # from naive_per_tensor_Quant import *
 # from _naive_per_tensor_quan_base import *
 
@@ -214,13 +215,17 @@ class Mlp(nn.Module):
                                 bias=True
                                 )
 
-    def forward(self, x, act_scaling_factor):
+    def forward(self, x, act_scaling_factor, iteration):
         x = self.fc1(x, act_scaling_factor)
         ##########TODO: Probe ##############first layer LLM은 여기서 outlier가 나온다고 햇음 
+        if iteration %200 == 0 :
+            process_tensor(x, iteration, layer = 'During MLP (fc1)')
         x = self.act(x)
         x, act_scaling_factor = self.qact1(x)
         x = self.fc2(x, act_scaling_factor)
         #########TODO: Probe ################ second layer LLM 기준으로는 여기서 outlier 안나옴 
+        if iteration %200 == 0 :
+            process_tensor(x, iteration, layer = 'After MLP (fc2)')
         return x
 
 
@@ -432,23 +437,27 @@ class Q_Block(nn.Module):
         )
         
 
-    def forward(self, x):
+    def forward(self, x, iteration):
         # x = x + self.drop_path(self.attn(self.norm1(x)))
         # x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         ###########TODO: Probe ##############
+        if iteration %200 == 0 :
+            process_tensor(x, iteration, layer = 'Transformer Block Input')
         residual_1 = x
         x = self.norm1(x)
         q_x, s_x = self.qact1(x)
         x = self.attn(q_x, s_x)
         ##########TODO: Probe #############after attention projection
+        if iteration %200 == 0 :
+            process_tensor(x, iteration, layer = 'After Attention (proj)')
 
         x = residual_1 + x
         residual_2 = x 
 
         x = self.norm2(x)
         q_x, s_x = self.qact3(x)
-        x = self.mlp(q_x, s_x) 
+        x = self.mlp(q_x, s_x, iteration) 
        
 
 
@@ -581,7 +590,7 @@ class lowbit_VisionTransformer(nn.Module):
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
     ####TODO: TODO: TODO: TODO: 
-    def forward_features(self, x):
+    def forward_features(self, x, iteration):
         x = self.patch_embed(x)
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         if self.dist_token is None:
@@ -589,15 +598,15 @@ class lowbit_VisionTransformer(nn.Module):
         else:
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x)
+        x = self.blocks(x, iteration)
         x = self.norm(x)
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
             return x[:, 0], x[:, 1]
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, iteration):
+        x = self.forward_features(x, iteration)
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
             if self.training and not torch.jit.is_scripting():
