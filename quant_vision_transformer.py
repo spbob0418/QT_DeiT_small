@@ -117,15 +117,17 @@ class Quantized_Linear(nn.Linear):
         self.weight_grad_quantize_module = weight_grad_quantize_module
         self.act_grad_quantize_module = act_grad_quantize_module
 
-    def forward(self, input, s_x):
-        return _quantize_global.apply(input, s_x, self.weight, self.bias, self.weight_quantize_module,
+    def forward(self, input, s_x, block_num, iteration, layer_info,):
+        return _quantize_global.apply(block_num, iteration, layer_info, input, s_x, self.weight, self.bias, self.weight_quantize_module,
                                       self.act_quantize_module, self.weight_grad_quantize_module, self.act_grad_quantize_module)
     
 
 class _quantize_global(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_3D, s_x, w_2D, bias=None, w_qmodule=None, a_qmodule=None, w_g_qmodule=None, a_g_qmodule=None):
-
+    def forward(ctx, block_num, iteration, layer_info, x_3D, s_x, w_2D, bias=None, w_qmodule=None, a_qmodule=None, w_g_qmodule=None, a_g_qmodule=None):
+        ctx.block_num = block_num
+        ctx.iteration = iteration
+        ctx.layer_info = layer_info
         x_2D = x_3D.view(-1, x_3D.size(-1)) #reshape to 2D
         x_2D = x_2D * s_x 
 
@@ -149,6 +151,8 @@ class _quantize_global(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, g_3D):
+
+        iteration = ctx.iteration
         g_2D = g_3D.reshape(-1, g_3D.size(-1))
         grad_X = grad_W = grad_bias = None 
         q_x, s_x, q_w, s_w = ctx.save_for_backward
@@ -170,14 +174,19 @@ class _quantize_global(torch.autograd.Function):
             grad_bias = g_2D.sum(dim=0)
         else:
             grad_bias = None
+        
+        if iteration % 400 == 0 and ctx.layer_info is not None:
+            process_tensor(grad_X, iteration, layer = ctx.layer_info + 'grad', block_num=ctx.block_num)
+            process_tensor(grad_W, iteration, layer = ctx.layer_info + 'grad', block_num=ctx.block_num)
 
-        return grad_X, None, grad_W, grad_bias, None, None, None, None
+        return None, None, None, grad_X, None, grad_W, grad_bias, None, None, None, None
 
 
 
 class Mlp(nn.Module):
     def __init__(
             self,
+            block_num,
             abits, 
             wbits,
             w_gbits, 
@@ -188,6 +197,7 @@ class Mlp(nn.Module):
             act_layer=False,
             drop=0.0):
         super().__init__()
+        self.block_num = block_num
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         # self.fc1 = nn.Linear(in_features, hidden_features)
@@ -216,16 +226,16 @@ class Mlp(nn.Module):
                                 )
 
     def forward(self, x, act_scaling_factor, iteration):
-        x = self.fc1(x, act_scaling_factor)
+        x = self.fc1(x, act_scaling_factor, self.block_num, iteration, layer_info = 'During MLP (fc1)')
         ##########TODO: Probe ##############first layer LLM은 여기서 outlier가 나온다고 햇음 
-        if iteration %200 == 0 :
-            process_tensor(x, iteration, layer = 'During MLP (fc1)')
+        if iteration %400 == 0 :
+            process_tensor(x, iteration, layer = 'During MLP (fc1)', block_num=self.block_num)
         x = self.act(x)
         x, act_scaling_factor = self.qact1(x)
-        x = self.fc2(x, act_scaling_factor)
+        x = self.fc2(x, act_scaling_factor, self.block_num, iteration, layer_info = 'After MLP (fc2)')
         #########TODO: Probe ################ second layer LLM 기준으로는 여기서 outlier 안나옴 
-        if iteration %200 == 0 :
-            process_tensor(x, iteration, layer = 'After MLP (fc2)')
+        if iteration %400 == 0 :
+            process_tensor(x, iteration, layer = 'After MLP (fc2)', block_num=self.block_num)
         return x
 
 
@@ -321,6 +331,7 @@ default_cfgs = {
 class Attention(nn.Module):
     def __init__(
             self,
+            block_num,
             abits, 
             wbits, 
             w_gbits,
@@ -336,7 +347,7 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
-
+        self.block_num = block_num
         self.norm_q = nn.LayerNorm(head_dim)
         self.norm_k = nn.LayerNorm(head_dim)
 
@@ -373,9 +384,9 @@ class Attention(nn.Module):
         # self.matmul_1 = QuantMatMul()
         # self.matmul_2 = QuantMatMul()
 
-    def forward(self, x, act_scaling_factor):
+    def forward(self, x, act_scaling_factor, iteration):
         B, N, C = x.shape
-        x = self.qkv(x, act_scaling_factor) #quantized input, fp output
+        x = self.qkv(x, act_scaling_factor, self.block_num, iteration, layer_info = None) #quantized input, fp output
         
         # x, act_scaling_factor_1 = self.qact1(x)#Quantize output 
 
@@ -393,9 +404,11 @@ class Attention(nn.Module):
         # attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if iteration % 400 == 0 :
+            process_tensor(x, iteration, layer = 'Right After Attention', block_num=self.block_num)
 
         x, act_scaling_factor = self.qact2(x)
-        x = self.proj(x, act_scaling_factor) #quantized input, fp output
+        x = self.proj(x, act_scaling_factor, self.block_num, iteration, 'After Attention (proj)') #quantized input, fp output
         
         # x = self.proj_drop(x)
 
@@ -403,16 +416,18 @@ class Attention(nn.Module):
 
 class Q_Block(nn.Module):
 
-    def __init__(self, abits, wbits, w_gbits, a_gbits, dim, num_heads, mlp_ratio=4., 
+    def __init__(self, abits, wbits, w_gbits, a_gbits, dim, num_heads, block_num, mlp_ratio=4., 
                 #  qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.block_num = block_num
         ######
         self.qact1 = QuantAct(abits, 'per_tensor')
         # self.attn = Q_Attention(nbits_w, nbits_a, dim, num_heads=num_heads)
         ######
         self.attn = Attention(
+            block_num,
             abits,
             wbits,
             w_gbits,
@@ -426,6 +441,7 @@ class Q_Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.qact3 = QuantAct(abits, 'per_tensor')
         self.mlp = Mlp(
+            block_num,
             abits, 
             wbits, 
             w_gbits, 
@@ -442,15 +458,17 @@ class Q_Block(nn.Module):
         # x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         ###########TODO: Probe ##############
-        if iteration %200 == 0 :
-            process_tensor(x, iteration, layer = 'Transformer Block Input')
+        if iteration % 400 == 0 :
+            process_tensor(x, iteration, layer='Transformer Block Input', block_num=self.block_num)
+
         residual_1 = x
         x = self.norm1(x)
         q_x, s_x = self.qact1(x)
-        x = self.attn(q_x, s_x)
+        x = self.attn(q_x, s_x, iteration)
+
         ##########TODO: Probe #############after attention projection
-        if iteration %200 == 0 :
-            process_tensor(x, iteration, layer = 'After Attention (proj)')
+        if iteration % 400 == 0 :
+            process_tensor(x, iteration, layer='After Attention (proj)', block_num=self.block_num)
 
         x = residual_1 + x
         residual_2 = x 
@@ -460,14 +478,20 @@ class Q_Block(nn.Module):
         x = self.mlp(q_x, s_x, iteration) 
        
 
-
-
         x = residual_2 + x
-        
-
 
         return x
 
+class CustomSequential(nn.Module):
+    def __init__(self, *modules):
+        super(CustomSequential, self).__init__()
+        self.modules_list = nn.ModuleList(modules)
+
+    def forward(self, x, *args):
+        for module in self.modules_list:
+            x = module(x, *args)
+        return x
+    
 
 class lowbit_VisionTransformer(nn.Module):
     """ Vision Transformer
@@ -525,9 +549,14 @@ class lowbit_VisionTransformer(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
         #QBlock 
-        self.blocks = nn.Sequential(*[
-            Q_Block(abits, wbits, w_gbits, a_gbits, embed_dim, num_heads)
+        # self.blocks = nn.Sequential(*[
+        #     Q_Block(abits, wbits, w_gbits, a_gbits, embed_dim, num_heads)
+        #     for i in range(depth)])
+
+        self.blocks = CustomSequential(*[
+            Q_Block(abits, wbits, w_gbits, a_gbits, embed_dim, num_heads, block_num = i)
             for i in range(depth)])
+        
         self.norm = norm_layer(embed_dim)
 
         # Representation layer

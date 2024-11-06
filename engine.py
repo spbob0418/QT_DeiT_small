@@ -82,14 +82,13 @@ def evaluate(data_loader, model, device):
 
     # switch to evaluation mode
     model.eval()
-  
-    for images, target in metric_logger.log_every(data_loader, 10, header):
+    for iteration, (images, target) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
         # compute output
         # with torch.cuda.amp.autocast():
-        output = model(images)
+        output = model(images, iteration)
         loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
