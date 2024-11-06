@@ -35,8 +35,7 @@ def train_one_epoch(wandb_log, model: torch.nn.Module, teacher_model: torch.nn.M
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
+        # return_probe_tensor = (iteration % 10 == 0)
     
         outputs = model(samples)
         dist.barrier()
@@ -50,13 +49,11 @@ def train_one_epoch(wandb_log, model: torch.nn.Module, teacher_model: torch.nn.M
             sys.exit(1)
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
 
         # this attribute is added by timm on one optimizer (adahessian)
-        # is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        # loss_scaler(loss, optimizer, clip_grad=max_norm,
-        #             parameters=model.parameters(), create_graph=is_second_order)
+        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+        loss_scaler(loss, optimizer, clip_grad=max_norm,
+                    parameters=model.parameters(), create_graph=is_second_order)
 
         torch.cuda.synchronize()
         # if model_ema is not None:
